@@ -105,9 +105,9 @@ static float u2f(uint32_t x) {
 // X bits starting at N
 #define FP16_MASK_SHIFTED(X,N) (FP16_MASK(X) << N)
 static const uint32_t FP16_EXP_MASK = FP16_MASK_SHIFTED(5,10); // bits[10..14] of fp16
+static const uint16_t FP16_EXP_MAX = 0x1F;
 static const uint32_t FP16_MAN_MASK = FP16_MASK(10); // bits[0..9] of fp16
 static const uint32_t FP16_32_EXP_SHIFT = (22 - 10); // how much to shift to get at the exp bits
-static const uint16_t FP16_EXP_MAX = 0x1F;
 static const uint32_t FP16_BIAS = (1 << (5 - 1)) - 1; // 2^(e-1) - 1
 static inline uint16_t FP16_EXP(uint16_t val) {
     if (val > FP16_EXP_MAX) {
@@ -117,8 +117,8 @@ static inline uint16_t FP16_EXP(uint16_t val) {
     return val << 10;
 }
 
-static const uint32_t FP32_EXP_MAX = FP16_MASK(8);
-static const uint32_t FP32_EXP_MASK = FP32_EXP_MAX;
+static const uint32_t FP32_EXP_MAX = 0xFF;
+static const uint32_t FP32_EXP_MASK = FP16_MASK_SHIFTED(8,23);
 static const uint32_t FP32_MAN_MAX = FP16_MASK(10);
 static const uint32_t FP32_MAN_MASK = FP32_MAN_MAX;
 
@@ -137,19 +137,32 @@ std::string format_fp32(uint32_t val);
 static uint32_t   fp16to32(uint16_t u16)
 {
     std::cout << "fp16to32: " << format_fp16(u16) << "\n";
-    uint32_t s32 = (uint32_t)u16 << (31 - 15); // bit [15 to 31]
-    if ((u16 == FP16_EXP_MASK) & FP16_EXP_MASK) { // exp all 1's
-std::cout << "fp16to32: exp: all 1's\n";
+    uint32_t s32 = ((uint32_t)u16 & 0x8000) << (31 - 15); // bit [15 to 31]
+    if ((u16 & FP16_EXP_MASK) == FP16_EXP_MASK) { // exp all 1's
         if ((u16 & FP16_MAN_MASK) != 0) { // NaN
-            // shift the qnan payload (mantissa) all the way up to the top bits;
-            // this preserves the {q,s}nan bits
-            uint32_t m32_nan = FP32_EXP((uint32_t)(u16 & FP16_MAN_MASK));
-std::cout << "fp16to32: nan: m32: " << std::hex << m32_nan << "\n";
-            return s32 |FP16_EXP_MASK | m32_nan;
+            // strip the {q,s}high bit of the nan payload
+            // e.g. S    11111              XYYYYYYYYY
+            //                   /----------||||||||||
+            // translates to    /            |||||||||
+            //      S 11111111 X0000000000000YYYYYYYYY
+            // this preserves the type of NaN (X) but retains the payload
+            // in the low part of the word
+            //
+            const uint32_t QNAN_MASK = ((uint32_t)0x8000 >> (5+1));
+            uint32_t m32_nan =
+                (QNAN_MASK & u16) << (23 - 10) | ((~QNAN_MASK & ~(FP16_EXP_MASK|0x8000)) & u16);
+            // we know at least one of these bits is non-zero
+std::cout << "fp16to32: *nanh\n";
+std::cout << "  M: " << std::hex << m32_nan << "\n";
+std::cout << "    signaling: " << ((QNAN_MASK & u16) << (23 - 10)) <<  "\n";
+std::cout << "  E: " << std::hex << FP32_EXP_MASK << "\n";
+std::cout << "  S: " << std::hex << s32 << "\n";
+
+            return s32 | FP32_EXP_MASK | m32_nan;
         } else {
 std::cout << "fp16to32: +-inf\n";
-            // +-Infinity
-            return s32 | (0xFF << 23);
+            // +-Infinity: S 11111111 00000000000000000000000
+            return s32 | FP32_EXP_MASK;
         }
     } else if ((u16 & FP16_EXP_MASK) == 0) {
         uint32_t u32_man = (uint32_t)(u16 & FP16_MAN_MASK);
@@ -158,17 +171,15 @@ std::cout << "fp16to32: +-inf\n";
     std::cout << "fp16to32: +-0.0h\n";
             return s32;
         } else {
-    std::cout << "fp16to32: den: " << std::hex << u32_man << "\n";
+    std::cout << "fp16to32: den: m: " << std::hex << u32_man << "\n";
             // denorm fp16, we can convert this to a normalized fp32
             // by shifting the mantissa bits over one (we know we have
             // at least one more mantissa bit in fp32) and adding one
             // to the exponent
             // ==> (-1)^s * 2^-14 * 0.m...
-            u32_man >>= 1;
-            uint32_t m32_den = (uint32_t)((u16 & FP16_MAN_MASK) << 1); // <<1 normalize
+            uint32_t m32_den = u32_man >> 1; // normalize
 
-
-            return s32 | FP32_EXP(1) | u32_man;
+            return s32 | FP32_EXP(1) | m32_den;
         }
     } else {
         // norm
@@ -236,9 +247,9 @@ std::cout << "fp32to16: +/- 0.0h\n";
 std::cout << "fp32to16: norm\n";
         // normal case
         // maybe round to denorm
+
         abort();
     }
-
 }
 
 uint16_t   fp32to16(float f32)
@@ -331,7 +342,10 @@ static int totalFails;
 static void test_rt_f16(const char *context, uint16_t val16, uint16_t expected_value)
 {
     float mid = u2f(fp16to32(val16));
+    std::cout << "====> MID =" << format_fp32(f2u(mid)) << "  " << mid << "\n";
     uint16_t rt_val16 = fp32to16(mid);
+    std::cout << "<==== MID =" << format_fp16(rt_val16) << "\n";
+
     if (rt_val16 != expected_value) {
         if (context)
             std::cout << "  " << context << "\n";
@@ -347,12 +361,32 @@ static void test_rt_f16(const char *context, uint16_t val16)
 
 
 
+static void test16to32(const char *context, uint16_t in, uint32_t expected)
+{
+    auto res = fp16to32(in);
+    if (res != expected) {
+        std::cout << "TEST " << context << "\n";
+        std::cout << std::hex << format_fp16(in) << " ==> " << format_fp32(res) << " (" << u2f(res) << ")\n";
+        std::cout <<  "  expected             "        << format_fp32(expected) << " (" << u2f(expected) << ")\n";
+        totalFails++;
+    }
+}
+static void test32to16(const char *context, uint16_t in, float expected)
+{
+    test16to32(context, in, f2u(expected));
+}
+static void test32to16(const char *context, uint32_t in, uint16_t expected) { }
+static void test32to16(const char *context, float in, uint16_t expected)
+{
+    test16to32(context, f2u(in), expected);
+}
+
 // TODO: fp8
 // TODO: generalize to n bits
 
 static void startGroup(const char *nm)
 {
-    std::cout << nm << "\n";
+    std::cout << "-------------- GROUP " << nm << " ---------------\n";
 }
 static void endGroup()
 {
@@ -378,9 +412,17 @@ static void default_tests()
     test_rt_f16("-inf",0xfc00); // -inf
     endGroup();
 */
-
     startGroup("NAN");
-    test_rt_f16("snan",0x7c01); //   snan
+//    test16to32("snanh",  0x7C01 , 0x7F800001);
+//    test16to32("-snanh", 0xFC01 , 0xFF800001);
+    test16to32("snanh(0x7)",  0x7c07 , 0x7F800000);
+//    test16to32("-snanh(0x7)",  0xFc07 , 0xFF800000);
+
+//    test16to32("qnanh",  0x7E01 , 0x7FC00000);
+//    test16to32("-qnanh", 0xFC01 , 0x8F800000);
+//    test16to32("qnanh(0x77)", 0x7FC00077, 0x7c77);
+
+//    test_rt_f16("snan",0x7c01); //   snan
 //    test_rt_f16("-snan",0xfc01); //  -snan
     endGroup();
 
